@@ -1,0 +1,171 @@
+--- a/state.go
++++ b/state.go
+@@ -13,6 +13,7 @@
+ 	dtlsstate "github.com/pion/dtls/v3/internal/state"
+ 	dtlsutil "github.com/pion/dtls/v3/internal/util"
+ 	cryptosuite "github.com/pion/dtls/v3/pkg/crypto/ciphersuite"
++	"github.com/pion/dtls/v3/pkg/crypto/keyschedule"
+ 	"github.com/pion/dtls/v3/pkg/crypto/prf"
+ 	"github.com/pion/dtls/v3/pkg/protocol"
+ 	"github.com/pion/dtls/v3/pkg/protocol/handshake"
+@@ -33,6 +34,12 @@
+ 	rrcNegotiated             bool
+ 	isClient                  bool
+ 	version                   protocol.Version
++
++	// exporterMasterSecret is the DTLS 1.3 exporter_master_secret (RFC 8446
++	// section 7.5, inherited by RFC 9147). Only populated for a 1.3 connection;
++	// consumed by ExportKeyingMaterial's 1.3 branch. Not serialized (1.3 state
++	// serialization is unsupported). The hash comes from cipherSuiteDescriptor.
++	exporterMasterSecret []byte
+ 
+ 	CipherSuiteID      cryptosuite.ID
+ 	PeerCertificates   [][]byte
+@@ -145,6 +152,8 @@
+ 		IdentityHint:          bytes.Clone(common.IdentityHint),
+ 		SessionID:             bytes.Clone(common.SessionID),
+ 		NegotiatedProtocol:    common.NegotiatedProtocol,
++		// DTLS 1.3 keying-material exporter input (see ExportKeyingMaterial).
++		exporterMasterSecret: bytes.Clone(internalState.KeySchedule.ExporterMasterSecret),
+ 	}, nil
+ }
+ 
+@@ -360,7 +369,15 @@
+ 		return nil, dtlserrors.ErrContextUnsupported
+ 	} else if _, ok := invalidKeyingLabels()[label]; ok {
+ 		return nil, dtlserrors.ErrReservedExportKeyingMaterial
++	}
++
++	// DTLS 1.3 uses the TLS 1.3 exporter (RFC 8446 section 7.5, inherited by
++	// RFC 9147), NOT the DTLS 1.2 TLS-PRF. Without this branch SRTP-over-1.3
++	// cannot be keyed.
++	if s.version == protocol.Version1_3 {
++		return s.exportKeyingMaterial13(label, context, length)
+ 	}
++
+ 	cipherSuite, err := s.cipherSuite()
+ 	if err != nil {
+ 		return nil, err
+@@ -379,6 +396,38 @@
+ 	return prf.PHash(s.masterSecret, seed, length, cipherSuite.HashFunc())
+ }
+ 
++// exportKeyingMaterial13 implements the TLS 1.3 exporter (RFC 8446 section 7.5),
++// used by DTLS 1.3 (RFC 9147). For an empty context it computes:
++//
++//	Derive-Secret(exporter_master_secret, label, "")             -> exporterSecret
++//	HKDF-Expand-Label(exporterSecret, "exporter", Hash(""), len) -> keying material
++//
++// HKDF-Expand-Label carries RFC 9147 section 5.9's "dtls13" prefix (applied by
++// the keyschedule package), matching DTLS 1.3 peers such as BoringSSL/Chrome.
++// Unlike the 1.2 PRF path, the exporter output does NOT depend on client/server
++// role or the ClientHello/ServerHello randoms.
++func (s *State) exportKeyingMaterial13(label string, context []byte, length int) ([]byte, error) {
++	if s.cipherSuiteDescriptor == nil || len(s.exporterMasterSecret) == 0 {
++		return nil, dtlserrors.ErrHandshakeInProgress
++	}
++	hashFunc := s.cipherSuiteDescriptor.HashFunc()
++
++	// Derive-Secret(Secret, Label, "") = HKDF-Expand-Label(Secret, Label, Hash(""), Hash.length).
++	// keyschedule.DeriveSecret hashes an empty transcript when passed nil.
++	exporterSecret, err := keyschedule.DeriveSecret(hashFunc, s.exporterMasterSecret, label, nil)
++	if err != nil {
++		return nil, err
++	}
++
++	// HKDF-Expand-Label(exporterSecret, "exporter", Hash(context), length).
++	h := hashFunc()
++	if _, err := h.Write(context); err != nil { // context is empty for DTLS-SRTP
++		return nil, err
++	}
++
++	return keyschedule.HkdfExpandLabel(hashFunc, exporterSecret, "exporter", h.Sum(nil), length)
++}
++
+ // RemoteRandomBytes returns the remote client hello random bytes.
+ func (s *State) RemoteRandomBytes() [handshake.RandomBytesLength]byte {
+ 	return s.remoteRandom.RandomBytes
+--- a/conn_test.go
++++ b/conn_test.go
+@@ -5547,5 +5547,81 @@
+ 			require.NoError(t, event.Err)
+ 		case DetachedNoEvent:
+ 		}
++	}
++}
++
++// TestExportKeyingMaterial13 verifies the DTLS 1.3 keying-material exporter
++// (RFC 8446 section 7.5 / RFC 9147). It drives a real pion<->pion 1.3 handshake
++// and asserts both peers export IDENTICAL EXTRACTOR-dtls_srtp material of the
++// requested length. Agreement across the pipe is the meaningful correctness
++// signal: a broken exporter (e.g. the old 1.2-PRF-over-empty-master-secret path)
++// would not produce matching keys on both ends.
++func TestExportKeyingMaterial13(t *testing.T) {
++	report := test.CheckRoutines(t)
++	defer report()
++
++	const exportLabel = "EXTRACTOR-dtls_srtp"
++	const exportLen = 60 // SRTP: 2*(16-byte key + 14-byte salt)
++
++	ca, cb := dpipe.Pipe()
++
++	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++	defer cancel()
++
++	type result struct {
++		c   *Conn
++		err error
+ 	}
++	resultCh := make(chan result, 1)
++	go func() {
++		client, err := testClient(ctx, dtlsnet.PacketConnFromConn(ca), ca.RemoteAddr(), []ClientOption{
++			WithSRTPProtectionProfiles(SRTP_AES128_CM_HMAC_SHA1_80),
++			WithMinVersion(protocol.Version1_3),
++			WithMaxVersion(protocol.Version1_3),
++		}, true)
++		resultCh <- result{client, err}
++	}()
++
++	server, err := testServer(ctx, dtlsnet.PacketConnFromConn(cb), cb.RemoteAddr(), []ServerOption{
++		WithSRTPProtectionProfiles(SRTP_AES128_CM_HMAC_SHA1_80),
++		WithMinVersion(protocol.Version1_3),
++		WithMaxVersion(protocol.Version1_3),
++	}, true)
++	assert.NoError(t, err, "server 1.3 handshake failed")
++	res := <-resultCh
++	assert.NoError(t, res.err, "client 1.3 handshake failed")
++	client := res.c
++	defer func() {
++		_ = client.Close()
++		_ = server.Close()
++	}()
++
++	clientState, ok := client.ConnectionState()
++	assert.True(t, ok)
++	serverState, ok := server.ConnectionState()
++	assert.True(t, ok)
++
++	// Precondition: this really is a 1.3 connection (else we'd test the 1.2 path).
++	assert.Equal(t, protocol.Version1_3, clientState.NegotiatedVersion(), "client not on DTLS 1.3")
++	assert.Equal(t, protocol.Version1_3, serverState.NegotiatedVersion(), "server not on DTLS 1.3")
++
++	clientKM, err := clientState.ExportKeyingMaterial(exportLabel, nil, exportLen)
++	assert.NoError(t, err, "client ExportKeyingMaterial (1.3)")
++	serverKM, err := serverState.ExportKeyingMaterial(exportLabel, nil, exportLen)
++	assert.NoError(t, err, "server ExportKeyingMaterial (1.3)")
++
++	assert.Len(t, clientKM, exportLen, "1.3 exporter returned wrong length")
++	assert.NotEqual(t, make([]byte, exportLen), clientKM, "1.3 exporter returned all-zero material")
++	// The exporter is role-independent in 1.3, so both peers MUST agree.
++	assert.Equal(t, clientKM, serverKM, "1.3 exporter disagreement between peers")
++
++	// A different label must produce different material.
++	otherKM, err := clientState.ExportKeyingMaterial("EXPORTER-other", nil, exportLen)
++	assert.NoError(t, err)
++	assert.NotEqual(t, clientKM, otherKM, "1.3 exporter ignored the label")
++
++	// Non-empty context is intentionally unsupported (matches the 1.2 path and
++	// WebRTC's DTLS-SRTP usage, which always passes an empty context).
++	_, err = clientState.ExportKeyingMaterial(exportLabel, []byte{0x00}, exportLen)
++	assert.ErrorIs(t, err, dtlserrors.ErrContextUnsupported, "1.3 exporter should reject non-empty context")
+ }

@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html>
+  <!--
+    SPDX-FileCopyrightText: 2026 The Pion community <https://pion.ly>
+    SPDX-License-Identifier: MIT
+  -->
+<head>
+  <meta charset="utf-8">
+  <title>DTLS 1.3 &lt;-&gt; browser WebRTC demo</title>
+</head>
+<body>
+  <h2>DTLS 1.3 WebRTC demo</h2>
+  <p>
+    Click Start. The browser publishes a synthetic video track to the Pion
+    server over DTLS 1.3; the server loops it back on its own track. If the
+    video below renders, SRTP works in both directions over DTLS 1.3.
+  </p>
+  <div>
+    <button id="startBtn" onclick="start()">Start</button>
+  </div>
+  <input id="msg" placeholder="DataChannel message">
+  <button id="sendBtn" disabled onclick="sendMsg()">Send</button>
+  <div>
+    <p>Loopback video returned by the Go server:</p>
+    <video id="remote" autoplay playsinline muted width="320" height="240"
+           style="border:1px solid #888;background:#000"></video>
+  </div>
+  <pre id="log"></pre>
+
+  <canvas id="src" width="320" height="240" style="display:none"></canvas>
+  <script>
+    const pc = new RTCPeerConnection();
+    const channel = pc.createDataChannel("chat");
+
+    // Negotiated DTLS version, discovered from getStats() once connected and
+    // drawn onto the published video (see makeSyntheticVideoTrack). Empty until
+    // known. This is what the video panel shows the negotiated version -- the
+    // frames the browser publishes are looped back by the server and rendered.
+    let dtlsLabel = "";
+
+    // Synthetic outbound video track (no camera permission needed): animate a
+    // canvas and capture it as a MediaStreamTrack. Publishing this makes the Go
+    // server's OnTrack fire and receive SRTP -- the media path over DTLS.
+    function makeSyntheticVideoTrack() {
+      const canvas = document.getElementById("src");
+      const ctx = canvas.getContext("2d");
+      let t = 0;
+      setInterval(() => {
+        t += 1;
+        ctx.fillStyle = `hsl(${t % 360},70%,50%)`;
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = "white";
+        ctx.font = "18px sans-serif";
+        ctx.fillText("frame " + t, 10, 30);
+        // Prominent overlay once the DTLS version is known. Until then the
+        // handshake may already be done and media flowing -- we're just waiting
+        // for the browser to report the version in getStats -- so say so rather
+        // than "connecting" (which would be misleading once frames are looping).
+        if (dtlsLabel) {
+          ctx.font = "bold 28px sans-serif";
+          ctx.fillText("using " + dtlsLabel, 10, 135);
+        } else {
+          ctx.font = "18px sans-serif";
+          ctx.fillText("detecting DTLS version...", 10, 135);
+        }
+      }, 33); // ~30 fps
+      const stream = canvas.captureStream(30);
+      return stream.getVideoTracks()[0];
+    }
+
+    let dtlsResolved = false; // set once we read the negotiated version
+
+    // Resolve the negotiated DTLS version from getStats(). Chrome and Firefox
+    // both expose a "transport" stat, but the version field differs: the
+    // standard field is tlsVersion; older Chrome used dtlsVersion. The value is
+    // a raw 4-hex-digit TLS version, e.g. DTLS 1.2 = "FEFD", DTLS 1.3 = "FEFC".
+    async function resolveDtlsVersion() {
+      if (dtlsResolved) return;
+      let stats;
+      try {
+        stats = await pc.getStats();
+      } catch (e) {
+        return;
+      }
+      const transport = [...stats.values()].find(o => o.type === 'transport');
+      if (!transport) return; // transport stat not present yet
+      // Preferred: the standard tlsVersion field (Chrome). Firefox does not yet
+      // implement it, but does report dtlsCipher -- and the DTLS 1.3 cipher
+      // suites are distinct from 1.2's, so we can infer the version from it.
+      const rawVersion = transport.tlsVersion || transport.dtlsVersion;
+      const cipher = transport.dtlsCipher;
+      if (!rawVersion && !cipher) return; // neither available yet; poll again later
+      dtlsResolved = true;
+
+      const versionNumber = rawVersion ? dtlsVersionNumber(rawVersion)
+                                       : dtlsVersionFromCipher(cipher);
+      if (versionNumber) {
+        dtlsLabel = "DTLS v" + versionNumber; // -> video overlay "using DTLS v1.3"
+        const how = rawVersion ? `raw ${rawVersion}` : `inferred from cipher "${cipher}"`;
+        log(`DTLS version: DTLS ${versionNumber} (${how})`);
+      } else if (cipher) {
+        dtlsLabel = "DTLS (cipher " + cipher + ")";
+        log(`DTLS version: could not infer; cipher "${cipher}"`);
+      } else {
+        dtlsLabel = "DTLS (raw " + rawVersion + ")";
+        log(`DTLS version: unknown (raw ${rawVersion})`);
+      }
+      if (transport.dtlsRole) log(`DTLS role: ${transport.dtlsRole}`);
+      if (cipher) log(`DTLS cipher: ${cipher}`);
+    }
+
+    // Poll for the negotiated version independently of connectionState, which is
+    // unreliable/late on some browsers (notably Firefox). Resolves immediately
+    // and then polls tightly so the overlay flips to "using DTLS ..." as soon as
+    // the stat is available (rather than waiting a full interval). Stops once
+    // resolved.
+    let dtlsPoll = null;
+    function startDtlsVersionPolling() {
+      if (dtlsPoll) return;
+      let attempts = 0;
+      const tick = async () => {
+        attempts += 1;
+        await resolveDtlsVersion();
+        if (dtlsResolved) {
+          clearInterval(dtlsPoll);
+          dtlsPoll = null;
+        } else if (attempts > 100) { // ~15s at 150ms
+          clearInterval(dtlsPoll);
+          dtlsPoll = null;
+          dtlsLabel = "DTLS (version n/a)";
+          log("DTLS version: not reported by this browser (check the server log)");
+        }
+      };
+      tick(); // resolve immediately, don't wait a full interval
+      dtlsPoll = setInterval(tick, 150);
+    }
+
+    pc.onconnectionstatechange = () => {
+      log(`Connection state: ${pc.connectionState}`);
+      if (pc.connectionState === 'connected') resolveDtlsVersion();
+    };
+    pc.oniceconnectionstatechange = () => {
+      log(`ICE state: ${pc.iceConnectionState}`);
+      // Firefox drives to 'connected'/'completed' here more reliably than via
+      // connectionState; use it to trigger version resolution too.
+      if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+        resolveDtlsVersion();
+      }
+    };
+    pc.onsignalingstatechange = () => log(`Signaling state: ${pc.signalingState}`);
+
+    channel.onopen = () => {
+      log("DataChannel opened");
+      document.getElementById("sendBtn").disabled = false;
+    };
+    channel.onmessage = e => log(`Server: ${e.data}`);
+
+    pc.onicecandidate = event => {
+      if (event.candidate) {
+        fetch("/candidate", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify(event.candidate),
+        });
+      }
+    };
+    pc.ondatachannel = event => {
+      log(`Server opened a channel: ${event.channel.label}`);
+      event.channel.onmessage = ev => log(`Server sent: ${ev.data}`);
+    };
+
+    // The Go server loops our published video back on its own track. Rendering
+    // it proves the server's SRTP encrypt path (Go->browser) AND that the
+    // browser can decode it -- i.e. both SRTP directions over DTLS 1.3 work.
+    pc.ontrack = event => {
+      log(`Received remote track: kind=${event.track.kind}`);
+      const v = document.getElementById("remote");
+      if (v.srcObject !== event.streams[0]) {
+        v.srcObject = event.streams[0] || new MediaStream([event.track]);
+        log("Attached loopback video -- if it renders, both SRTP directions work");
+      }
+    };
+
+    async function start() {
+      document.getElementById("startBtn").disabled = true;
+      try {
+        // Publish the synthetic video track so the server receives SRTP media
+        // over DTLS 1.3.
+        try {
+          const vtrack = makeSyntheticVideoTrack();
+          pc.addTransceiver(vtrack, { direction: "sendrecv" });
+          log("Publishing synthetic video track (canvas capture)");
+        } catch (e) {
+          log(`Could not add video track: ${e.message}`);
+        }
+
+        await pc.setLocalDescription();
+        const offer = pc.localDescription;
+
+        const res = await fetch("/offer", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({type: "offer", sdp: offer.sdp}),
+        });
+        if (!res.ok) {
+          throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+        }
+
+        const answer = await res.json();
+        await pc.setRemoteDescription(answer);
+
+        // Resolve the negotiated DTLS version independently of the state-change
+        // events (unreliable on some browsers). Polls getStats() until found.
+        startDtlsVersionPolling();
+      } catch (err) {
+        log(`Connection failed: ${err.message}`);
+        console.error("Connection error:", err);
+      }
+    }
+
+    function sendMsg() {
+      const msg = document.getElementById("msg").value;
+      if (msg.trim()) {
+        channel.send(msg);
+        log(`You: ${msg}`);
+        document.getElementById("msg").value = "";
+      }
+    }
+
+    function log(msg) {
+      document.getElementById("log").textContent += msg + "\n";
+    }
+
+    // Map a raw TLS/DTLS version (4 hex digits) to a bare version number. DTLS
+    // uses the 1's-complement encoding: 1.2 = 0xFEFD, 1.3 = 0xFEFC.
+    function dtlsVersionNumber(raw) {
+      switch (String(raw).toUpperCase()) {
+        case "FEFF": return "1.0";
+        case "FEFD": return "1.2";
+        case "FEFC": return "1.3";
+        default:     return null;
+      }
+    }
+
+    // Friendly "DTLS 1.x" label for logs (null version -> "unknown").
+    function prettyDtlsVersion(raw) {
+      const n = dtlsVersionNumber(raw);
+      return n ? "DTLS " + n : "unknown";
+    }
+
+    // Infer the DTLS version from the negotiated cipher-suite name, for browsers
+    // (e.g. Firefox) that report dtlsCipher but not tlsVersion. DTLS 1.3 uses the
+    // TLS 1.3 AEAD suites -- "TLS_AES_128_GCM_SHA256", "TLS_AES_256_GCM_SHA384",
+    // "TLS_CHACHA20_POLY1305_SHA256" -- which have NO key-exchange component in
+    // the name. DTLS 1.2 suites name the key exchange, e.g.
+    // "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256". So: a suite that names ECDHE/RSA/
+    // DHE/PSK key exchange is 1.2; a bare AES/CHACHA20 AEAD suite is 1.3.
+    function dtlsVersionFromCipher(cipher) {
+      if (!cipher) return null;
+      const c = String(cipher).toUpperCase();
+      if (/ECDHE|ECDH_|_RSA_|DHE_|_PSK/.test(c)) return "1.2";
+      if (/^TLS_(AES_\d+_GCM|CHACHA20_POLY1305)/.test(c)) return "1.3";
+      return null; // unrecognized -> caller shows the raw cipher
+    }
+  </script>
+</body>
+</html>
