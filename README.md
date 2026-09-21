@@ -6,6 +6,9 @@ directions over DTLS 1.3**: the browser publishes a synthetic video track, the
 server receives it and loops it back, and the browser renders the returned
 video.
 
+![DTLS 1.3 WebRTC demo: the browser shows the looped-back video overlaid with
+"using DTLS v1.3", confirming SRTP flows both ways over DTLS 1.3.](docs/screenshot.png)
+
 > Status: DTLS 1.3 is still unreleased in Pion. This demo builds against a
 > 1.3-capable `pion/dtls` plus two small patches (see [Patches](#patches)). It is
 > a proof of concept, not production code.
